@@ -1,4 +1,4 @@
-# Template for /etc/wireguard/wg0.conf  (-> /srv/nfs/data/wireguard/wg0.conf)
+# Template for /etc/wireguard/wg0.conf  (-> /persist/wireguard/wg0.conf)
 #
 # THIS FILE IS PARSED BY `wg setconf`, NOT BY wg-quick. wg setconf accepts
 # ONLY: [Interface] PrivateKey, ListenPort, FwMark; [Peer] PublicKey,

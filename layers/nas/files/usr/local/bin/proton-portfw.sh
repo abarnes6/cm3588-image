@@ -7,7 +7,7 @@ set -eu
 NETNS=qbt
 GATEWAY=10.2.0.1
 QBT_API=http://10.200.0.2:8080/api/v2
-# Optional WEBUI_USER=/WEBUI_PASS=, on the array beside the WireGuard keys.
+# Optional WEBUI_USER=/WEBUI_PASS=, beside the WireGuard keys.
 # Without them this falls back to unauthenticated calls, which only work with
 # the subnet whitelist enabled — and the whitelist authenticates nobody (the
 # MASQUERADE collapses every client to one address), so set real credentials.

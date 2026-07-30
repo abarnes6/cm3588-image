@@ -1,15 +1,16 @@
 # layers/nas/layer.sh — the author's NAS deployment, kept as a worked example:
-# Plex + qBittorrent-behind-WireGuard + NFS on a 4x NVMe md raid0. Static
+# Plex + qBittorrent-behind-WireGuard + NFS. Static
 # files live in files/ (synced in automatically); this script adds packages,
 # repos, kernel config, and hooks that must RUN in the chroot. Replace the
-# measured values (array UUIDs, MAC, subnets) with your own.
+# measured values (UUIDs, MAC, subnets) with your own.
 #
 # Operator notes for this deployment:
 #  * WireGuard confs are parsed by `wg setconf`, NOT wg-quick: strip Address=,
 #    DNS=, MTU=, Post* (see files/usr/local/share/wg0.conf.template).
-#  * Align uids on the array BEFORE first boot, services stopped:
-#      chown -R 951:951 /srv/nfs/data/plex-appdata
-#      chown -R 950:950 /srv/nfs/data/qbt-appdata
+#  * Appdata lives on /persist. When restoring it, align uids BEFORE the
+#    services first start:
+#      chown -R 951:951 /persist/plex-appdata
+#      chown -R 950:950 /persist/qbt-appdata
 #    Leave wireguard/ at root:root 0700 — qbt must not read the private key.
 #  * After first boot: append `mdadm --detail --scan` output to
 #    /etc/mdadm/mdadm.conf, restore /etc/exports, and set qBittorrent WebUI
@@ -30,7 +31,7 @@ EXTRA_PACKAGES="${EXTRA_PACKAGES:+$EXTRA_PACKAGES,}mdadm,nfs-kernel-server,curl,
 # Lines restating an arm64 default are deliberate: assert_config then enforces
 # the value this box needs on every kernel bump.
 KERNEL_FRAGMENT_EXTRA="$KERNEL_FRAGMENT_EXTRA
-# 4x NVMe md raid0 exported over NFS
+# storage behind /srv/nfs/data, and its NFS export
 CONFIG_BLK_DEV_MD=y
 CONFIG_MD_RAID0=y
 CONFIG_NFSD=m
@@ -56,7 +57,7 @@ LAYER_HOOKS+=(
   '[ -s "$1/usr/lib/plexmediaserver/lib/plexmediaserver.service" ] || { echo "FATAL: plexmediaserver did not install" >&2; exit 1; }'
   'install -m0644 "$1/usr/lib/plexmediaserver/lib/plexmediaserver.service" "$1/usr/lib/systemd/system/plexmediaserver.service"'
   'chroot "$1" systemctl enable plexmediaserver.service'
-  # Pinned uid/gid: appdata lives on the array and outlives the image.
+  # Pinned uid/gid: appdata lives on /persist and outlives the image.
   'chroot "$1" sh -c "getent group plex >/dev/null || addgroup --system --gid 951 plex"'
   'chroot "$1" sh -c "getent passwd plex >/dev/null || adduser --system --uid 951 --gid 951 --home /var/lib/plexmediaserver --no-create-home plex"'
   'grep -q "^plex:[^:]*:951:951:" "$1/etc/passwd" || { echo "FATAL: plex is not uid/gid 951:951 — $(grep "^plex:" "$1/etc/passwd")" >&2; exit 1; }'
@@ -72,8 +73,7 @@ LAYER_HOOKS+=(
   # GID float even with the UID pinned.
   'chroot "$1" addgroup --system --gid 950 qbt'
   'chroot "$1" adduser --system --uid 950 --gid 950 --home /nonexistent --no-create-home qbt'
-  # Keys stay on the array behind this symlink; the archived image holds no
-  # secrets.
-  'rm -rf "$1/etc/wireguard" && ln -s /srv/nfs/data/wireguard "$1/etc/wireguard"'
+  # Keys stay behind this symlink; the archived image holds no secrets.
+  'rm -rf "$1/etc/wireguard" && ln -s /persist/wireguard "$1/etc/wireguard"'
   'chroot "$1" systemctl enable qbt-netns.service qbittorrent-nox.service qbt-portfw.timer qbt-wg-select.timer'
 )

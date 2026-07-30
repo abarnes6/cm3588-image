@@ -4,8 +4,8 @@ Documentation=file:///usr/local/share/wg0.conf.template
 # Wants= is required: After= alone never pulls the target in.
 Wants=network-online.target
 After=network-online.target
-# wg*.conf lives on the array, behind the /etc/wireguard symlink.
-RequiresMountsFor=/srv/nfs/data
+# wg*.conf lives behind the /etc/wireguard symlink, on /persist.
+RequiresMountsFor=/persist
 
 [Service]
 Type=oneshot

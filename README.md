@@ -93,7 +93,7 @@ LAYERS="layers/nas /home/me/my-layer" ./build.sh
 Relative paths resolve inside this repo; absolute paths are bind-mounted into
 the builder, so your personal layer can live in its own repository and never
 conflict with pulling this one. To start your own, copy `layers/nas/` and
-replace its measured values (array UUIDs, MAC address, LAN subnets) — they are
+replace its measured values (UUIDs, MAC address, LAN subnets) — they are
 one deployment's facts, not defaults. Each build's manifest records the layer
 list and a hash of every `layer.sh`. Note that layers feed the kernel config,
 so switching layer sets triggers a kernel rebuild.
@@ -148,6 +148,17 @@ For the same reason `/etc/fstab` has **no `/` entry** at all, and `/` is mounted
 `rw` directly rather than remounted.
 
 ## Updating
+
+One command from the build host:
+
+```bash
+./deploy.sh        # newest build in out/; target from DEPLOY_HOST (env or deploy.env)
+```
+
+It pushes the `.rootfs.img.gz` to the board, runs the `slotctl update` +
+`reboot` below, then watches the trial and exits 0 only once the new slot is
+marked good (1 if the board rolled back). On the board itself the same update
+is:
 
 ```bash
 slotctl update out/cm3588-trixie-<stamp>.rootfs.img.gz <sha256>
@@ -206,6 +217,6 @@ Two consequences of image-based updates worth internalising:
 complete example of what a layer can do: Plex from its own apt repo (with
 build-chroot workarounds its postinst needs), qBittorrent confined to a
 WireGuard network namespace with a kill switch and Proton NAT-PMP port
-forwarding, NFS exports of a 4× NVMe md raid0, smartd as the array's only
-early warning, and pinned service uids so appdata on the array survives
+forwarding, NFS exports of the 4× NVMe data mount, smartd as the disks' only
+early warning, and pinned service uids so appdata on `/persist` survives
 reimaging.

@@ -1,3 +1,3 @@
 # Must be an EnvironmentFile, not Environment= in the drop-in: EnvironmentFile
 # settings override Environment=, so the package's own file would win.
-PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR="/srv/nfs/data/plex-appdata/Library/Application Support"
+PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR="/persist/plex-appdata/Library/Application Support"

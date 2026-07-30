@@ -49,8 +49,8 @@ up() {
 
   [ -n "$WG_CONF" ] && [ -s "$WG_CONF" ] || {
     echo "FATAL: no usable /etc/wireguard/wg*.conf." >&2
-    echo "  They live on the array (/etc/wireguard -> /srv/nfs/data/wireguard)," >&2
-    echo "  so the array must be mounted first. Format: see" >&2
+    echo "  They live behind /etc/wireguard -> /persist/wireguard," >&2
+    echo "  so that mount must be up first. Format: see" >&2
     echo "  /usr/local/share/wg0.conf.template — this is parsed by 'wg setconf'," >&2
     echo "  NOT wg-quick, so Address=/DNS=/MTU=/Post* must be stripped out." >&2
     exit 1; }

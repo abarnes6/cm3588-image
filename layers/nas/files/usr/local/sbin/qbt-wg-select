@@ -1,6 +1,8 @@
 #!/bin/sh
 # qbt-wg-select — keep wg0 pointed at a Proton endpoint that actually works.
 # Each /etc/wireguard/wg*.conf is one endpoint, tried in filename order.
+# Healthy = fresh handshake AND a route past Proton's exit (see routes()) —
+# a server can keep handshaking while routing nothing.
 #
 # THE SWITCH DOES NOT BREAK THE KILL SWITCH: `wg setconf` replaces the peer
 # set on the EXISTING wg0, so the namespace's only route stays
@@ -13,6 +15,8 @@ IFACE=wg0
 STATE=/run/qbt-wg-active
 # A healthy peer handshakes at least every ~2 min.
 STALE_AFTER=190
+# Trial iterations per endpoint; an iteration costs 1s, plus up to 4s of
+# probe timeouts once the endpoint handshakes but does not route.
 HANDSHAKE_WAIT=12
 
 in_ns() { ip netns exec "$NS" "$@"; }
@@ -25,7 +29,16 @@ handshake_age() {
   if [ "${latest:-0}" -gt 0 ]; then echo $(( now - latest )); else echo 999999; fi
 }
 
-healthy() { [ "$(handshake_age)" -le "$STALE_AFTER" ]; }
+# A fresh handshake is NOT enough: a Proton server can answer handshakes
+# (and gateway pings — 10.2.0.1 kept responding through one such outage)
+# while routing nothing past its exit. Probe the far side by IP; DNS lives
+# in-tunnel at that same gateway, so a hostname would test the wrong thing.
+routes() {
+  in_ns ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || \
+    in_ns ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1
+}
+
+healthy() { [ "$(handshake_age)" -le "$STALE_AFTER" ] && routes; }
 
 # WireGuard only initiates a handshake on outbound traffic; poke the tunnel.
 # The gateway need not answer — the attempt triggers negotiation.
@@ -42,7 +55,12 @@ if [ -n "$CURRENT" ] && healthy; then
   exit 0
 fi
 if [ -n "$CURRENT" ]; then
-  echo "endpoint $CURRENT stopped handshaking ($(handshake_age)s ago); failing over"
+  age="$(handshake_age)"
+  if [ "$age" -le "$STALE_AFTER" ]; then
+    echo "endpoint $CURRENT handshakes (${age}s ago) but routes nothing past the gateway; failing over"
+  else
+    echo "endpoint $CURRENT stopped handshaking (${age}s ago); failing over"
+  fi
 fi
 
 # Try the current endpoint LAST: a dead one must not be retried ahead of a
@@ -71,11 +89,11 @@ for conf in $ORDER; do
     i=$(( i + 1 ))
     sleep 1
   done
-  echo "  no handshake from $conf after ${HANDSHAKE_WAIT}s"
+  echo "  $conf not healthy (no handshake, or no route past the gateway)"
 done
 
 # Total outage: the last config stays applied, wg0 keeps the only route —
 # NOT a leak. The timer retries; the non-zero exit makes it visible.
 rm -f "$STATE"
-echo "FATAL: no endpoint completed a handshake; tunnel down, traffic blocked (not leaking)" >&2
+echo "FATAL: no endpoint is both handshaking and routing; tunnel down, traffic blocked (not leaking)" >&2
 exit 1

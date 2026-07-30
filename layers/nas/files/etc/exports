@@ -1,5 +1,6 @@
-# NO space before the paren. sync is deliberate on raid0 (no redundancy);
-# root_squash underpins the chmod-700 shielding of plex-appdata. The export
-# is gated on the array being mounted by the nfs-server drop-in — without it
-# a failed mount would export the empty stub directory rw to the whole LAN.
+# NO space before the paren. sync is deliberate (nothing behind this export
+# survives a crash gracefully); root_squash denies LAN clients uid 0 on the
+# export. The export is gated on /srv/nfs/data being mounted by the
+# nfs-server drop-in — without it a failed mount would export the empty stub
+# directory rw to the whole LAN.
 /srv/nfs/data 192.168.86.0/24(rw,sync,no_subtree_check,root_squash) 10.0.0.0/24(rw,sync,no_subtree_check,root_squash)
