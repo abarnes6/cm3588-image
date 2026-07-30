@@ -1,0 +1,16 @@
+#!/bin/sh
+# Grow the persist partition to fill the medium, once, on first boot. The
+# root slots are deliberately NOT grown: updates write a fixed-size image.
+set -eu
+
+SRC="$(findmnt -no SOURCE /persist)"
+DISK="/dev/$(lsblk -no pkname "$SRC")"
+PART="$(basename "$SRC")"
+NUM="${PART##*[!0-9]}"
+[ -n "$NUM" ] || { echo "FATAL: cannot derive a partition number from $SRC" >&2; exit 1; }
+
+# growpart: 0 = grown, 1 = nothing to do, 2 = FAILED.
+growpart "$DISK" "$NUM" || [ "$?" = 1 ]
+resize2fs "$SRC"
+
+: > /persist/.grown

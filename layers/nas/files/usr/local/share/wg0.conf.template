@@ -1,0 +1,25 @@
+# Template for /etc/wireguard/wg0.conf  (-> /srv/nfs/data/wireguard/wg0.conf)
+#
+# THIS FILE IS PARSED BY `wg setconf`, NOT BY wg-quick. wg setconf accepts
+# ONLY: [Interface] PrivateKey, ListenPort, FwMark; [Peer] PublicKey,
+# PresharedKey, AllowedIPs, Endpoint, PersistentKeepalive.
+#
+# ProtonVPN's download includes `Address =` and `DNS =` (wg-quick
+# extensions); leave them in and qbt-netns fails with "Line unrecognized".
+# The address is set by qbt-netns and DNS by /etc/netns/qbt/resolv.conf.
+#
+# Do NOT "fix" this by switching to wg-quick: it would create wg0 inside the
+# namespace, which breaks the kill switch (see qbt-netns).
+
+[Interface]
+PrivateKey = <from the Proton config>
+# Address  = 10.2.0.2/32     <- DELETE, set by qbt-netns
+# DNS      = 10.2.0.1        <- DELETE, set by /etc/netns/qbt/resolv.conf
+
+[Peer]
+PublicKey = <from the Proton config>
+AllowedIPs = 0.0.0.0/0
+Endpoint = <server-ip>:51820
+# wg0's socket sits behind the LAN router's NAT; the keepalive holds the
+# mapping open.
+PersistentKeepalive = 25

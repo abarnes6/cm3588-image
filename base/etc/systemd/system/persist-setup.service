@@ -1,0 +1,17 @@
+[Unit]
+Description=Set up state that survives an A/B slot switch
+# /persist is a nofail mount: this still runs (and warns) without it, because
+# losing ssh host keys must not mean losing the box.
+Wants=persist.mount
+After=persist.mount
+# Beat sshd to the host keys. Ordinary dependencies: DefaultDependencies=no
+# once created a cycle through local-fs.target.
+Before=ssh.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/persist-setup
+
+[Install]
+WantedBy=multi-user.target

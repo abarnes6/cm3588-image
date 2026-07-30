@@ -1,0 +1,10 @@
+[Unit]
+Description=Proton NAT-PMP renewal (60s lease, renewed at half-life)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

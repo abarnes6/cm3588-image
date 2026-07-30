@@ -1,0 +1,10 @@
+# Pin the RTL8125's MAC (no burned-in address) so the DHCP identity survives
+# A/B updates. A matching .link REPLACES 99-default.link outright — NamePolicy
+# must be restated or the NIC stays eth0.
+[Match]
+Driver=r8169
+
+[Link]
+NamePolicy=keep kernel database onboard slot path
+AlternativeNamesPolicy=database onboard slot path
+MACAddress=BE:20:04:51:56:2C

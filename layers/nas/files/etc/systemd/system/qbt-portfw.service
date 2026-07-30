@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew Proton NAT-PMP mapping and sync qBittorrent listen port
+After=qbittorrent-nox.service
+# Deliberately no Wants=: that made every timer firing restart a qBittorrent
+# stopped for maintenance. Skip instead when the namespace is not up.
+ConditionPathExists=/run/netns/qbt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proton-portfw.sh

@@ -1,0 +1,139 @@
+#!/bin/sh
+# flash-emmc — write a built A/B image to the on-board eMMC from a system booted
+# off SD, with the safety checks encoded so they can't be skipped.
+#
+# usage: flash-emmc <image.img.gz> [target-device]
+#
+# The target is auto-detected as the non-removable MMC; mmcblk numbering is
+# probe order, so it is NOT assumed to be mmcblk0.
+set -eu
+# pipefail (dash 0.5.12 supports it): without it a zcat dying mid-stream
+# leaves dd a clean EOF and a half-written eMMC that verify would certify.
+( set -o pipefail ) 2>/dev/null && set -o pipefail
+
+IMG="${1:?usage: flash-emmc <image.img.gz> [target-device]}"
+
+[ -s "$IMG" ] || { echo "FATAL: $IMG missing or empty" >&2; exit 1; }
+case "$IMG" in
+  *.rootfs.img.gz)
+    echo "FATAL: $IMG is the payload for slotctl update, not a disk image." >&2
+    echo "       Flash the full image: $(echo "$IMG" | sed 's/\.rootfs\.img\.gz$/.img.gz/')" >&2
+    exit 1;;
+  *.img.gz) ;;
+  *) echo "FATAL: expected a .img.gz" >&2; exit 1;;
+esac
+
+### ── resolve the target ───────────────────────────────────────────────────
+if [ $# -ge 2 ]; then
+  TARGET="$2"
+else
+  TARGET=""
+  for d in /sys/block/mmcblk*; do
+    [ -e "$d/device/type" ] || continue
+    case "${d##*/}" in *boot*|*rpmb*|*gp[0-9]*) continue;; esac
+    [ "$(cat "$d/device/type")" = "MMC" ] || continue   # "SD" = removable card
+    [ -z "$TARGET" ] || { echo "FATAL: multiple eMMC devices found; pass one explicitly" >&2; exit 1; }
+    TARGET="/dev/${d##*/}"
+  done
+  [ -n "$TARGET" ] || { echo "FATAL: no non-removable MMC found; pass the device explicitly" >&2; exit 1; }
+fi
+[ -b "$TARGET" ] || { echo "FATAL: $TARGET is not a block device" >&2; exit 1; }
+
+### ── refuse to saw off the branch we're sitting on ────────────────────────
+ROOTDEV="$(findmnt -no SOURCE /)"
+case "$ROOTDEV" in
+  "$TARGET"*) echo "FATAL: root is on $TARGET — boot from SD to flash eMMC" >&2; exit 1;;
+esac
+if findmnt -rno SOURCE | grep -q "^$TARGET"; then
+  echo "FATAL: partitions on $TARGET are mounted:" >&2
+  findmnt -rno SOURCE,TARGET | grep "^$TARGET" >&2
+  exit 1
+fi
+
+### ── capacity check before we destroy anything ────────────────────────────
+# One decompression pass: gzip -l reports ISIZE mod 2^32. Reused as the
+# verify length.
+echo "Measuring $IMG ..."
+IMG_BYTES="$(zcat "$IMG" | wc -c)"
+TGT_BYTES="$(blockdev --getsize64 "$TARGET")"
+[ "$IMG_BYTES" -gt 0 ] || { echo "FATAL: $IMG decompresses to nothing" >&2; exit 1; }
+[ "$IMG_BYTES" -le "$TGT_BYTES" ] || {
+  echo "FATAL: image is $IMG_BYTES bytes, $TARGET holds only $TGT_BYTES" >&2; exit 1; }
+
+### ── confirm, echoing the resolved device's identity ──────────────────────
+SYSDEV="/sys/block/${TARGET##*/}/device"
+echo
+echo "About to OVERWRITE $TARGET with $IMG"
+echo "  target:   $TARGET  ($(cat "$SYSDEV/type" 2>/dev/null || echo '?') \
+$(cat "$SYSDEV/name" 2>/dev/null || echo '?') \
+$(cat "$SYSDEV/manfid" 2>/dev/null || echo '?'), \
+removable=$(cat "/sys/block/${TARGET##*/}/removable" 2>/dev/null || echo '?'), \
+$((TGT_BYTES / 1024 / 1024)) MiB)"
+echo "  image:    $IMG ($((IMG_BYTES / 1024 / 1024)) MiB uncompressed)"
+echo "  our root: $ROOTDEV"
+lsblk "$TARGET"
+printf 'Type YES to proceed: '
+read -r ANSWER
+[ "$ANSWER" = "YES" ] || { echo "aborted"; exit 1; }
+
+### ── write, hashing the stream as it goes ─────────────────────────────────
+TMP="$(mktemp -d)"
+FLASH_OK=""
+cleanup() {
+  rc=$?
+  rm -rf "$TMP"
+  [ -n "$FLASH_OK" ] || cat >&2 <<EOF
+
+!!! $TARGET IS IN AN UNKNOWN STATE — the flash did not complete successfully.
+!!! Do NOT power off and remove the SD card. Re-run flash-emmc until it prints
+!!! EMMC_VERIFIED, or the board will boot a partially-written eMMC.
+EOF
+  exit $rc
+}
+trap cleanup EXIT INT TERM
+
+mkfifo "$TMP/tap"
+sha256sum < "$TMP/tap" | cut -d' ' -f1 > "$TMP/src.sum" &
+zcat "$IMG" | tee "$TMP/tap" | dd of="$TARGET" bs=4M conv=fsync status=progress
+wait
+
+### ── verify the whole image read back from the media ──────────────────────
+# --flushbufs, or the read-back is served from the page cache and compares
+# the source to itself.
+echo "Verifying $((IMG_BYTES / 1024 / 1024)) MiB read back from $TARGET ..."
+blockdev --flushbufs "$TARGET"
+dd if="$TARGET" bs=4M iflag=count_bytes count="$IMG_BYTES" status=none \
+  | sha256sum | cut -d' ' -f1 > "$TMP/dst.sum"
+
+SRC="$(cat "$TMP/src.sum")"; DST="$(cat "$TMP/dst.sum")"
+[ "$SRC" = "$DST" ] || {
+  echo "FATAL: eMMC VERIFY FAILED" >&2
+  echo "  image:  $SRC" >&2
+  echo "  device: $DST" >&2
+  exit 1
+}
+echo "EMMC_VERIFIED  sha256=$SRC"
+FLASH_OK=1
+
+blockdev --rereadpt "$TARGET"   # partprobe ships in parted, not installed
+lsblk "$TARGET"
+
+### ── break the GPT identity collision with the medium we booted from ──────
+# The eMMC is now a byte-identical copy of this SD, GPT included. boot.scr
+# resolves root= via `part uuid`, so randomise the TARGET's identifiers.
+# PARTLABELs stay: slotctl and /persist find partitions by them.
+newuuid() { cat /proc/sys/kernel/random/uuid; }   # uuidgen is not installed
+
+echo "Randomising GPT identifiers on $TARGET so it cannot be confused with $ROOTDEV ..."
+sfdisk --disk-id "$TARGET" "$(newuuid)" >/dev/null
+NPARTS="$(partx -g "$TARGET" | wc -l)"
+N=1
+while [ "$N" -le "$NPARTS" ]; do
+  sfdisk --part-uuid "$TARGET" "$N" "$(newuuid)" >/dev/null
+  N=$((N + 1))
+done
+blockdev --rereadpt "$TARGET"
+
+sync
+echo
+echo "Done. Power off, remove the SD card, and power on to boot from eMMC."

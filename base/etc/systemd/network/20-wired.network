@@ -1,0 +1,10 @@
+[Match]
+Name=e*
+
+[Network]
+DHCP=yes
+
+[DHCPv4]
+# Key the lease on the MAC (pinned in 10-persistent-mac.link), not on a DUID
+# derived from machine-id, which is regenerated per A/B slot.
+ClientIdentifier=mac

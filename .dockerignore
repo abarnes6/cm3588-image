@@ -1,0 +1,5 @@
+# podman streams the whole context before consulting the layer cache; without
+# this every run ships the multi-GB work/ tree. (podman does NOT read .gitignore.)
+work/
+out/
+.git/

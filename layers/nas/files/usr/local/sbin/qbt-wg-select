@@ -1,0 +1,81 @@
+#!/bin/sh
+# qbt-wg-select — keep wg0 pointed at a Proton endpoint that actually works.
+# Each /etc/wireguard/wg*.conf is one endpoint, tried in filename order.
+#
+# THE SWITCH DOES NOT BREAK THE KILL SWITCH: `wg setconf` replaces the peer
+# set on the EXISTING wg0, so the namespace's only route stays
+# `default dev wg0` throughout. Do not "improve" this into deleting and
+# recreating the interface.
+set -eu
+
+NS=qbt
+IFACE=wg0
+STATE=/run/qbt-wg-active
+# A healthy peer handshakes at least every ~2 min.
+STALE_AFTER=190
+HANDSHAKE_WAIT=12
+
+in_ns() { ip netns exec "$NS" "$@"; }
+
+# Age in seconds of the newest handshake across all peers; huge if never.
+handshake_age() {
+  now="$(date +%s)"
+  latest="$(in_ns wg show "$IFACE" latest-handshakes 2>/dev/null \
+            | awk '{ if ($2 > m) m = $2 } END { print m+0 }')"
+  if [ "${latest:-0}" -gt 0 ]; then echo $(( now - latest )); else echo 999999; fi
+}
+
+healthy() { [ "$(handshake_age)" -le "$STALE_AFTER" ]; }
+
+# WireGuard only initiates a handshake on outbound traffic; poke the tunnel.
+# The gateway need not answer — the attempt triggers negotiation.
+poke() {
+  in_ns timeout 2 curl -s -o /dev/null --max-time 2 http://10.2.0.1/ >/dev/null 2>&1 || true
+}
+
+CONFS="$(ls -1 /etc/wireguard/wg*.conf 2>/dev/null || true)"
+[ -n "$CONFS" ] || { echo "FATAL: no /etc/wireguard/wg*.conf found" >&2; exit 1; }
+
+CURRENT="$(cat "$STATE" 2>/dev/null || true)"
+
+if [ -n "$CURRENT" ] && healthy; then
+  exit 0
+fi
+if [ -n "$CURRENT" ]; then
+  echo "endpoint $CURRENT stopped handshaking ($(handshake_age)s ago); failing over"
+fi
+
+# Try the current endpoint LAST: a dead one must not be retried ahead of a
+# possibly-healthy alternative.
+ORDER=""
+for c in $CONFS; do
+  if [ "$c" != "$CURRENT" ]; then ORDER="$ORDER $c"; fi
+done
+if [ -n "$CURRENT" ]; then ORDER="$ORDER $CURRENT"; fi
+
+for conf in $ORDER; do
+  echo "trying endpoint $conf"
+  if ! in_ns wg setconf "$IFACE" "$conf"; then
+    echo "  rejected by wg setconf — check for Address=/DNS=/MTU=, which are" >&2
+    echo "  wg-quick extensions that wg setconf does not accept" >&2
+    continue
+  fi
+  poke
+  i=0
+  while [ "$i" -lt "$HANDSHAKE_WAIT" ]; do
+    if healthy; then
+      printf '%s' "$conf" > "$STATE"
+      echo "  active endpoint: $conf"
+      exit 0
+    fi
+    i=$(( i + 1 ))
+    sleep 1
+  done
+  echo "  no handshake from $conf after ${HANDSHAKE_WAIT}s"
+done
+
+# Total outage: the last config stays applied, wg0 keeps the only route —
+# NOT a leak. The timer retries; the non-zero exit makes it visible.
+rm -f "$STATE"
+echo "FATAL: no endpoint completed a handshake; tunnel down, traffic blocked (not leaking)" >&2
+exit 1

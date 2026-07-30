@@ -1,0 +1,17 @@
+[Unit]
+Description=WireGuard network namespace for qBittorrent
+Documentation=file:///usr/local/share/wg0.conf.template
+# Wants= is required: After= alone never pulls the target in.
+Wants=network-online.target
+After=network-online.target
+# wg*.conf lives on the array, behind the /etc/wireguard symlink.
+RequiresMountsFor=/srv/nfs/data
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/qbt-netns up
+ExecStop=/usr/local/sbin/qbt-netns down
+
+[Install]
+WantedBy=multi-user.target

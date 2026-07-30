@@ -1,0 +1,20 @@
+
+/*
+ * Appended to the board's u-boot.dtsi by build-inner.sh. Load-bearing: with
+ * no bootstd node U-Boot auto-binds EVERY compiled-in bootmeth, and extlinux/
+ * script sort before rauc — either would boot slot A directly, silently
+ * bypassing slot selection. Declaring only "rauc" leaves exactly one bootmeth
+ * bound (per doc/develop/bootstd/overview.rst, a bootstd node must list ALL
+ * bootmeths you want). Do not add extlinux or script children back.
+ */
+
+/ {
+	bootstd {
+		compatible = "u-boot,boot-std";
+		filename-prefixes = "/", "/boot/";
+
+		rauc {
+			compatible = "u-boot,distro-rauc";
+		};
+	};
+};

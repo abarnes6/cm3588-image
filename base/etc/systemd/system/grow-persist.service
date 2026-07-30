@@ -1,0 +1,17 @@
+[Unit]
+Description=Grow the persist partition to fill the disk on first boot
+Requires=persist.mount
+After=persist.mount
+# persist-setup may remount /persist from the correct disk when both the
+# rescue SD and the eMMC are present; grow only after that is settled.
+After=persist-setup.service
+ConditionPathIsMountPoint=/persist
+ConditionPathExists=!/persist/.grown
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/grow-persist
+
+[Install]
+WantedBy=multi-user.target

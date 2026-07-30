@@ -1,0 +1,11 @@
+[Unit]
+Description=Select a working Proton endpoint for the qbt tunnel
+After=qbt-netns.service
+# Skip rather than fail when the namespace is not up.
+ConditionPathExists=/run/netns/qbt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/qbt-wg-select
+# A total outage (every endpoint down) exits non-zero on purpose so it is
+# visible in `systemctl list-units --failed`. Traffic is blocked, not leaking.

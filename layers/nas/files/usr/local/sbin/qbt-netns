@@ -1,0 +1,107 @@
+#!/bin/sh
+# qbt-netns — build/tear down the WireGuard namespace that confines
+# qBittorrent. THE KILL SWITCH: inside netns "qbt" the only route is
+# `default dev wg0`; if the tunnel is down, traffic fails rather than leaks.
+#
+# DO NOT "SIMPLIFY" THE wg0 CREATION ORDER: wg0 is created in the ROOT
+# namespace and moved into qbt. A WireGuard interface keeps its encrypted UDP
+# socket in the namespace it was CREATED in — that is what lets ciphertext
+# egress normally while the namespace sees only plaintext.
+set -eu
+
+NS=qbt
+# Initial endpoint only; qbt-wg-select replaces it if it is not handshaking.
+WG_CONF="$(ls -1 /etc/wireguard/wg*.conf 2>/dev/null | head -1)"
+NS_ADDR=10.2.0.2/32            # Proton's assignment; matches /etc/netns/qbt/resolv.conf
+VETH_HOST_ADDR=10.200.0.1
+VETH_NS_ADDR=10.200.0.2
+WEBUI_PORT=8080
+# Reachability control only: the MASQUERADE below collapses every client to
+# one address, so qBittorrent's subnet whitelist cannot authenticate anyone —
+# set real WebUI credentials.
+LAN_SUBNETS="192.168.86.0/24 10.0.0.0/24"
+FWD_SAVED=/run/qbt-netns.ip_forward
+
+nft_del() { iptables "$@" 2>/dev/null || true; }
+
+down() {
+  for s in $LAN_SUBNETS; do
+    nft_del -t nat -D PREROUTING -s "$s" -p tcp --dport "$WEBUI_PORT" \
+      -j DNAT --to-destination "$VETH_NS_ADDR:$WEBUI_PORT"
+  done
+  nft_del -D FORWARD -o veth-host -p tcp -d "$VETH_NS_ADDR" --dport "$WEBUI_PORT" -j ACCEPT
+  nft_del -D FORWARD -i veth-host -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  nft_del -t nat -D POSTROUTING -o veth-host -j MASQUERADE
+  ip netns del "$NS" 2>/dev/null || true
+  ip link del veth-host 2>/dev/null || true
+  ip link del wg0 2>/dev/null || true          # only if the move never happened
+  if [ -r "$FWD_SAVED" ]; then
+    sysctl -qw "net.ipv4.ip_forward=$(cat "$FWD_SAVED")"
+    rm -f "$FWD_SAVED"
+  fi
+  rm -f /run/qbt-wg-active
+}
+
+up() {
+  # Always rebuild from a known state: a crash can leave a half-built,
+  # possibly leaky namespace that a "skip if exists" guard would keep.
+  down
+
+  [ -n "$WG_CONF" ] && [ -s "$WG_CONF" ] || {
+    echo "FATAL: no usable /etc/wireguard/wg*.conf." >&2
+    echo "  They live on the array (/etc/wireguard -> /srv/nfs/data/wireguard)," >&2
+    echo "  so the array must be mounted first. Format: see" >&2
+    echo "  /usr/local/share/wg0.conf.template — this is parsed by 'wg setconf'," >&2
+    echo "  NOT wg-quick, so Address=/DNS=/MTU=/Post* must be stripped out." >&2
+    exit 1; }
+
+  ip netns add "$NS"
+  ip netns exec "$NS" ip link set lo up
+  # No IPv6: leave no unconfigured v6 stack as a path around the tunnel.
+  ip netns exec "$NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+  ip netns exec "$NS" sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+
+  # --- the tunnel (see the header note on creation order) ---
+  ip link add wg0 type wireguard
+  ip link set wg0 netns "$NS"
+  ip netns exec "$NS" wg setconf wg0 "$WG_CONF"
+  ip netns exec "$NS" ip addr add "$NS_ADDR" dev wg0
+  ip netns exec "$NS" ip link set wg0 up
+  ip netns exec "$NS" ip route add default dev wg0
+
+  # --- veth pair, for the WebUI only ---
+  ip link add veth-host type veth peer name veth-qbt
+  ip link set veth-qbt netns "$NS"
+  ip addr add "$VETH_HOST_ADDR/24" dev veth-host
+  ip link set veth-host up
+  ip netns exec "$NS" ip addr add "$VETH_NS_ADDR/24" dev veth-qbt
+  ip netns exec "$NS" ip link set veth-qbt up
+
+  cat /proc/sys/net/ipv4/ip_forward > "$FWD_SAVED"
+  sysctl -qw net.ipv4.ip_forward=1
+
+  # Source-scoped DNAT: without -s, anything that can route a packet here
+  # reaches the WebUI.
+  for s in $LAN_SUBNETS; do
+    iptables -t nat -A PREROUTING -s "$s" -p tcp --dport "$WEBUI_PORT" \
+      -j DNAT --to-destination "$VETH_NS_ADDR:$WEBUI_PORT"
+  done
+  iptables -A FORWARD -o veth-host -p tcp -d "$VETH_NS_ADDR" --dport "$WEBUI_PORT" -j ACCEPT
+  iptables -A FORWARD -i veth-host -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  # MASQUERADE is LOAD-BEARING: the namespace's only route is wg0, so an
+  # un-SNATed reply to a LAN client would go into the tunnel and be lost.
+  # Cost: qBittorrent sees every client as 10.200.0.1, so its subnet
+  # whitelist cannot authenticate anyone.
+  iptables -t nat -A POSTROUTING -o veth-host -j MASQUERADE
+
+  # Non-fatal: with every endpoint down the namespace still exists with wg0
+  # as its only route — the kill switch working.
+  /usr/local/sbin/qbt-wg-select || \
+    echo "WARNING: no Proton endpoint is up; tunnel is down (traffic blocked, not leaking)" >&2
+}
+
+case "${1:-}" in
+  up)   up ;;
+  down) down ;;
+  *)    echo "usage: qbt-netns up|down" >&2; exit 2 ;;
+esac

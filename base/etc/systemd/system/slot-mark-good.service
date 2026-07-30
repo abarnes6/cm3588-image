@@ -1,0 +1,21 @@
+[Unit]
+Description=Mark the running A/B slot healthy
+# Deliberately late: "this slot works" is only a real claim once everything
+# that should be up is up. Deliberately NOT ordered after network-online: the
+# script polls for the route itself, and waiting out wait-online's own timeout
+# would add up to 120s to every rollback of a network-broken slot.
+After=multi-user.target ssh.service
+Requires=persist-setup.service
+After=persist-setup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# mark-good polls health for up to 120s before its verdict; the default 90s
+# start timeout would kill it mid-poll, skipping the trial-rollback reboot.
+TimeoutStartSec=180
+ExecStart=/usr/local/sbin/slotctl mark-good
+# On failure, leave the try counter alone and let U-Boot roll back.
+
+[Install]
+WantedBy=multi-user.target

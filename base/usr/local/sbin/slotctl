@@ -1,0 +1,309 @@
+#!/bin/sh
+# slotctl — operate the A/B slot machinery.
+#
+#   slotctl update <rootfs.img.gz|URL> [sha256]        install into the inactive slot
+#   slotctl update-loader <uboot.bin.gz|URL> [sha256]  rewrite the loader region in place
+#   slotctl mark-good                                  declare the running slot healthy
+#   slotctl status                                     show slot, boot order, tries, trial
+#
+set -eu
+# pipefail (dash 0.5.12 supports it): without it a zcat dying mid-stream
+# leaves dd a clean EOF and a half-written target that verify would certify.
+( set -o pipefail ) 2>/dev/null && set -o pipefail
+
+usage() {
+  cat <<EOF
+usage: slotctl <command>
+
+  update <rootfs.img.gz|URL> [sha256]        install into the inactive slot
+  update-loader <uboot.bin.gz|URL> [sha256]  rewrite the loader region in place
+  mark-good                                  declare the running slot healthy (run by systemd at boot)
+  status                                     show slot, boot order, tries, trial
+EOF
+}
+
+### ── shared helpers ────────────────────────────────────────────────────────
+need_root() { [ "$(id -u)" = 0 ] || { echo "FATAL: must be root" >&2; exit 1; }; }
+
+cur_slot() { sed -n 's/.*rauc\.slot=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline; }
+
+# fetch <path|URL> — sets LOCAL to a readable file. $TMP must exist.
+fetch() {
+  case "$1" in
+    http://*|https://*)
+      echo "downloading $1 ..."
+      curl -fsSL --retry 3 -o "$TMP/payload.gz" "$1"
+      LOCAL="$TMP/payload.gz" ;;
+    *)
+      [ -s "$1" ] || { echo "FATAL: $1 missing or empty" >&2; exit 1; }
+      LOCAL="$1" ;;
+  esac
+}
+
+# check_sha <file> <want-or-empty> <what> — verify BEFORE writing: noticing
+# corruption afterwards means the fallback slot (or the loader) is already
+# gone.
+check_sha() {
+  if [ -n "$2" ]; then
+    echo "verifying sha256 ..."
+    GOT="$(sha256sum "$1" | cut -d' ' -f1)"
+    [ "$GOT" = "$2" ] || {
+      echo "FATAL: sha256 mismatch" >&2
+      echo "  expected $2" >&2
+      echo "  got      $GOT" >&2
+      exit 1; }
+  else
+    echo "WARNING: no sha256 given; installing an unverified $3." >&2
+  fi
+}
+
+# write_verified <gz> <dev> <byte-offset> <bytes> — stream-write while hashing
+# the stream, then read back from the media and compare. --flushbufs, or the
+# read-back is served from the page cache and compares the source to itself.
+write_verified() {
+  rm -f "$TMP/tap"; mkfifo "$TMP/tap"
+  sha256sum < "$TMP/tap" | cut -d' ' -f1 > "$TMP/src" &
+  zcat "$1" | tee "$TMP/tap" \
+    | dd of="$2" bs=4M oflag=seek_bytes seek="$3" conv=fsync status=progress
+  wait
+  echo "verifying read-back from $2 ..."
+  blockdev --flushbufs "$2"
+  dd if="$2" bs=4M iflag=skip_bytes,count_bytes skip="$3" count="$4" status=none \
+    | sha256sum | cut -d' ' -f1 > "$TMP/dst"
+  WRITTEN_SHA="$(cat "$TMP/src")"
+  [ "$WRITTEN_SHA" = "$(cat "$TMP/dst")" ]
+}
+
+### ── update: install a rootfs image into the inactive slot ────────────────
+# If the new slot fails to boot and mark itself good, U-Boot exhausts its
+# attempts and falls back to the current slot on its own.
+cmd_update() {
+  IMG="${1:?usage: slotctl update <rootfs.img.gz|URL> [sha256]}"
+  WANT_SHA="${2:-}"
+  TRIES=3
+  need_root
+  command -v fw_setenv >/dev/null || { echo "FATAL: fw_setenv missing (libubootenv-tool)" >&2; exit 1; }
+
+  CUR="$(cur_slot)"
+  [ -n "$CUR" ] || { echo "FATAL: no rauc.slot= on the cmdline — not an A/B system?" >&2; exit 1; }
+  case "$CUR" in
+    A) TARGET=B; TARGET_LABEL=rootB ;;
+    B) TARGET=A; TARGET_LABEL=rootA ;;
+    *) echo "FATAL: unrecognised slot '$CUR'" >&2; exit 1 ;;
+  esac
+
+  ROOTSRC="$(findmnt -no SOURCE /)"
+  DISK="/dev/$(lsblk -no pkname "$ROOTSRC")"
+  DEV=""
+  for p in $(lsblk -lno NAME "$DISK" | tail -n +2); do
+    [ "$(lsblk -no PARTLABEL "/dev/$p" 2>/dev/null)" = "$TARGET_LABEL" ] || continue
+    DEV="/dev/$p"; break
+  done
+  [ -n "$DEV" ] || { echo "FATAL: no partition labelled $TARGET_LABEL on $DISK" >&2; exit 1; }
+  [ "$DEV" != "$ROOTSRC" ] || { echo "FATAL: refusing to overwrite the running root" >&2; exit 1; }
+  if findmnt -rno SOURCE | grep -qx "$DEV"; then
+    echo "FATAL: $DEV is mounted; refusing to write it" >&2; exit 1
+  fi
+
+  echo "running slot $CUR ($ROOTSRC) -> installing into slot $TARGET ($DEV)"
+
+  fetch "$IMG"
+  check_sha "$LOCAL" "$WANT_SHA" "image"
+
+  SIZE="$(zcat "$LOCAL" | wc -c)"
+  DEVSIZE="$(blockdev --getsize64 "$DEV")"
+  [ "$SIZE" -le "$DEVSIZE" ] || {
+    echo "FATAL: image is $SIZE bytes, slot $TARGET holds $DEVSIZE" >&2; exit 1; }
+
+  # Demote the target BEFORE destroying it: zero tries takes it out of
+  # U-Boot's fallback rotation, so a power cut mid-write cannot leave a
+  # half-written slot eligible to boot.
+  fw_setenv "BOOT_${TARGET}_LEFT" 0
+
+  echo "writing $((SIZE / 1024 / 1024)) MiB to $DEV ..."
+  write_verified "$LOCAL" "$DEV" 0 "$SIZE" || {
+    echo "FATAL: slot $TARGET does not match the image after writing." >&2
+    echo "       Slot $TARGET stays disarmed (0 tries); BOOT_ORDER untouched —" >&2
+    echo "       you are still on slot $CUR." >&2
+    exit 1; }
+
+  # Counter BEFORE boot order: no window where the new slot is preferred with
+  # a stale or zero counter. Trial flag likewise BEFORE boot order: no window
+  # where the new slot can boot unhealthy without being on probation
+  # (mark-good reboots an unhealthy trial slot instead of leaving it up).
+  fw_setenv "BOOT_${TARGET}_LEFT" "$TRIES"
+  fw_setenv BOOT_TRIAL "$TARGET"
+  fw_setenv BOOT_ORDER "$TARGET $CUR"
+
+  cat <<EOF
+
+Slot $TARGET installed and queued for boot ($TRIES attempts).
+
+  reboot
+
+If it comes up healthy, mark-good makes it permanent. If it fails to boot —
+or boots but stays unhealthy, which reboots it — the $TRIES attempts drain
+and U-Boot returns you to slot $CUR on its own. Nothing on the running slot
+has been modified.
+EOF
+}
+
+### ── update-loader: rewrite the raw loader region in place ────────────────
+# The loader is the one non-A/B piece: the BootROM reads sector 64 of this
+# disk with no fallback logic, so no try counter protects this write. It runs
+# for a few seconds; a power cut inside it leaves THIS DISK unbootable until
+# a rescue SD reflashes it. Slot contents and the U-Boot environment (the
+# slot state at 13 MiB) are never touched — the size check is the same
+# contract the build asserts.
+cmd_update_loader() {
+  IMG="${1:?usage: slotctl update-loader <uboot.bin.gz|URL> [sha256]}"
+  WANT_SHA="${2:-}"
+  need_root
+
+  case "$IMG" in
+    *.uboot.bin.gz) ;;
+    *.rootfs.img.gz)
+      echo "FATAL: $IMG is the payload for 'slotctl update', not a loader." >&2; exit 1;;
+    *.img.gz)
+      echo "FATAL: $IMG is a full disk image for flash-emmc, not a loader." >&2; exit 1;;
+    *) echo "FATAL: expected a .uboot.bin.gz" >&2; exit 1;;
+  esac
+
+  ROOTSRC="$(findmnt -no SOURCE /)"
+  DISK="/dev/$(lsblk -no pkname "$ROOTSRC")"
+  [ -b "$DISK" ] || { echo "FATAL: cannot resolve the boot disk from $ROOTSRC" >&2; exit 1; }
+
+  fetch "$IMG"
+  check_sha "$LOCAL" "$WANT_SHA" "loader"
+
+  SIZE="$(zcat "$LOCAL" | wc -c)"
+  LOADER_MAX=$(( 13 * 1024 * 1024 - 64 * 512 ))
+  [ "$SIZE" -gt 0 ] || { echo "FATAL: $IMG decompresses to nothing" >&2; exit 1; }
+  [ "$SIZE" -le "$LOADER_MAX" ] || {
+    echo "FATAL: loader is $SIZE bytes; only $LOADER_MAX fit below the env at 13 MiB" >&2
+    exit 1; }
+
+  echo
+  echo "About to rewrite the loader on $DISK — the disk this system booted from."
+  echo "  loader:  $IMG ($SIZE bytes)"
+  echo "  target:  $DISK sector 64 (slots and U-Boot env untouched)"
+  echo "  A power cut during the write leaves $DISK unbootable until a rescue"
+  echo "  SD reflashes it. Have one before typing YES."
+  printf 'Type YES to proceed: '
+  read -r ANSWER
+  [ "$ANSWER" = "YES" ] || { echo "aborted"; exit 1; }
+
+  write_verified "$LOCAL" "$DISK" $(( 64 * 512 )) "$SIZE" || {
+    echo "FATAL: loader read-back does not match — DO NOT REBOOT." >&2
+    echo "       Re-run 'slotctl update-loader' until it prints LOADER_VERIFIED," >&2
+    echo "       or reflash this disk from the rescue SD." >&2
+    exit 1; }
+
+  sync
+  echo "LOADER_VERIFIED  sha256=$WRITTEN_SHA"
+  echo "Takes effect on the next reboot."
+}
+
+### ── mark-good: declare the running slot healthy ──────────────────────────
+# Resets the running slot's try counter. If this never runs, the counter
+# drains and U-Boot falls back to the other slot: doing nothing is the safe
+# outcome.
+#
+# Health is POLLED for up to TIMEOUT seconds: the checks legitimately come up
+# late (DHCP), and a verdict rendered at t=0 would fail every boot. The
+# slot-mark-good unit's TimeoutStartSec must stay above TIMEOUT. TIMEOUT
+# bounds trial failover (~ tries x (boot + TIMEOUT)); raise it only if this
+# box ever legitimately needs longer than this after multi-user to hold a
+# default route.
+FAIL=""
+check() {
+  if "$@" >/dev/null 2>&1; then
+    echo "  ok      $*"
+  else
+    echo "  FAILED  $*" >&2
+    FAIL=1
+  fi
+}
+
+# Deliberately NOT `systemctl is-system-running`: --wait deadlocks from inside
+# the boot transaction, and "no failed units" lets an external outage (a VPN
+# endpoint down) veto the slot. These are the recoverability checks: if they
+# pass, an operator can reach the box and repair anything else.
+health() {
+  FAIL=""
+  check sh -c 'ip -4 route show default | grep -q .'
+  check systemctl is-active ssh.service
+  check mountpoint -q /persist
+  [ -z "$FAIL" ]
+}
+
+cmd_mark_good() {
+  TIMEOUT=120
+  need_root
+
+  SLOT="$(cur_slot)"
+  [ -n "$SLOT" ] || { echo "FATAL: no rauc.slot= on the cmdline" >&2; exit 1; }
+
+  # BOOT_TRIAL is set by `slotctl update` and cleared here. While it names a
+  # slot, that slot is on probation: an unhealthy trial boot reboots to burn
+  # a try instead of staying up, so a bad update rolls back unattended.
+  TRIAL="$(fw_printenv -n BOOT_TRIAL 2>/dev/null || true)"
+
+  DEADLINE=$(( $(date +%s) + TIMEOUT ))
+  until health >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$DEADLINE" ] || break
+    sleep 10
+  done
+
+  # One loud run for the journal, whichever way it went.
+  echo "health check for slot $SLOT:"
+  if health; then
+    fw_setenv "BOOT_${SLOT}_LEFT" 3
+    if [ -n "$TRIAL" ]; then
+      fw_setenv BOOT_TRIAL
+      if [ "$TRIAL" = "$SLOT" ]; then
+        echo "update trial of slot $SLOT succeeded."
+      else
+        echo "WARNING: slot $TRIAL failed its update trial; rolled back to $SLOT." >&2
+      fi
+    fi
+    echo "slot $SLOT marked good."
+  else
+    if [ "$TRIAL" = "$SLOT" ]; then
+      echo "slot $SLOT NOT healthy ${TIMEOUT}s into its update trial; rebooting to" >&2
+      echo "burn a try. U-Boot falls back to the old slot when the tries are gone." >&2
+      systemctl reboot --no-block
+    else
+      echo "slot $SLOT NOT marked good; it will roll back on the next reboot." >&2
+    fi
+    exit 1
+  fi
+}
+
+### ── status ────────────────────────────────────────────────────────────────
+cmd_status() {
+  need_root
+  SLOT="$(cur_slot)"
+  printf '%-12s %s\n' slot "${SLOT:-unknown} ($(findmnt -no SOURCE /))"
+  for v in BOOT_ORDER BOOT_A_LEFT BOOT_B_LEFT BOOT_TRIAL; do
+    printf '%-12s %s\n' "$v" "$(fw_printenv -n "$v" 2>/dev/null || echo '(unset)')"
+  done
+}
+
+### ── dispatch ──────────────────────────────────────────────────────────────
+[ $# -gt 0 ] || { usage >&2; exit 1; }
+CMD="$1"; shift
+
+case "$CMD" in
+  update|update-loader)
+    TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT INT TERM ;;
+esac
+
+case "$CMD" in
+  update)         cmd_update "$@" ;;
+  update-loader)  cmd_update_loader "$@" ;;
+  mark-good)      cmd_mark_good ;;
+  status)         cmd_status ;;
+  help|-h|--help) usage ;;
+  *) echo "FATAL: unknown command '$CMD'" >&2; usage >&2; exit 1 ;;
+esac

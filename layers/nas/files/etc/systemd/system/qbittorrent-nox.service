@@ -1,0 +1,50 @@
+[Unit]
+Description=qBittorrent-nox confined to the WireGuard namespace
+# BindsTo: qBittorrent must never run outside the tunnel.
+Requires=qbt-netns.service
+BindsTo=qbt-netns.service
+After=qbt-netns.service
+RequiresMountsFor=/srv/nfs/data
+
+[Service]
+Type=exec
+User=qbt
+Group=qbt
+NetworkNamespacePath=/run/netns/qbt
+# NetworkNamespacePath= does NOT perform `ip netns exec`'s /etc/netns/* bind
+# mounts; without this the daemon reads the host resolv.conf, whose 127.0.0.53
+# stub does not exist inside the namespace, and every lookup times out.
+BindReadOnlyPaths=/etc/netns/qbt/resolv.conf:/etc/resolv.conf
+
+WorkingDirectory=/srv/nfs/data/qbt-appdata
+Environment=HOME=/srv/nfs/data/qbt-appdata
+# "+" runs as root despite User=; the profile lives on the array and cannot
+# be created at build time.
+ExecStartPre=+/usr/bin/install -d -o qbt -g qbt -m 0750 /srv/nfs/data/qbt-appdata
+ExecStart=/usr/bin/qbittorrent-nox --webui-port=8080 --confirm-legal-notice --profile=/srv/nfs/data/qbt-appdata
+
+LimitNOFILE=50000
+# 0022: the profile sits inside the NFS export, where AUTH_SYS gids are
+# client-asserted — group-writable state would let any LAN client claiming
+# gid 950 rewrite the config.
+UMask=0022
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing. Deliberately NOT set: SystemCallFilter and
+# MemoryDenyWriteExecute — Qt has historically tripped both.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/nfs/data
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
